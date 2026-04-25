@@ -1,0 +1,53 @@
+[package]
+name = "setowire"
+version = "0.1.1"
+edition = "2021"
+description = "A lightweight, portable P2P networking library built on UDP. No central servers, no brokers — peers find each other and communicate directly."
+license = "MIT"
+authors = ["Setowire Team"]
+repository = "https://github.com/setowire/rs-setowire"
+keywords = ["p2p", "udp", "networking", "dht", "nat-traversal", "relay", "swarm"]
+categories = ["network-programming", "p2p"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Cryptography
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+digest = "0.10"
+hkdf = "0.12"
+
+# Random
+rand = "0.8"
+getrandom = "0.2"
+
+# Encoding & utilities
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+bytes = "1.5"
+parking_lot = "0.12"
+tracing = "0.1"
+thiserror = "1.0"
+anyhow = "1.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[lib]
+name = "setowire"
+path = "index.rs"
+
+[[bin]]
+name = "chat"
+path = "chat.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
