@@ -130,23 +130,42 @@ swarm.on_data(Box::new(|data: &[u8], peer: &Peer| { ... }));
 
 ## Protocol
 
-The wire protocol is plain UDP. Each packet starts with a 1-byte frame type:
+Plain UDP. Each packet starts with a 1-byte frame type:
 
-| byte | type | description |
-|---|---|---|
-| `0x01` | DATA | encrypted application data |
-| `0x03` | PING | keepalive + RTT measurement |
-| `0x04` | PONG | keepalive reply |
-| `0x0A` | GOAWAY | graceful disconnect |
-| `0x0B` | FRAG | fragment of a large message |
-| `0x13` | BATCH | multiple frames in one datagram |
-| `0x14` | CHUNK_ACK | acknowledgement for reliable multi-chunk transfers |
-| `0x20` | RELAY_ANN | peer announcing itself as relay |
-| `0x21` | RELAY_REQ | request introduction via relay |
-| `0x22` | RELAY_FWD | relay forwarding an introduction |
-| `0x30` | PEX | peer exchange |
+| Byte | Type | Description |
+|------|------|-------------|
+| `0x01` | DATA | Encrypted application data |
+| `0x03` | PING | Keepalive + RTT |
+| `0x04` | PONG | Keepalive reply |
+| `0x0A` | GOAWAY | Graceful disconnect |
+| `0x0B` | FRAG | Fragment |
+| `0x10` | HAVE | Announce available keys |
+| `0x11` | WANT | Request a key |
+| `0x12` | CHUNK | Data chunk |
+| `0x13` | BATCH | Multiple frames |
+| `0x14` | CHUNK_ACK | Chunk acknowledgement |
+| `0x20` | RELAY_ANN | Relay announcement |
+| `0x21` | RELAY_REQ | Relay request |
+| `0x22` | RELAY_FWD | Relay forward |
+| `0x30` | PEX | Peer exchange |
+| `0xA1` | HELLO | Handshake |
+| `0xA2` | HELLO_ACK | Handshake ack |
 
-Handshake is two frames: `0xA1` (hello) and `0xA2` (hello ack). Each carries the sender's ID and raw X25519 public key. After that, all data is encrypted.
+Handshake: `0xA1` (HELLO) and `0xA2` (HELLO_ACK). Each carries Peer ID (20 bytes) + X25519 Public Key (32 bytes). After handshake, all data is encrypted.
+
+### Handshake Functions
+
+```rust
+// Parse HELLO/HELLO_ACK frame with validation
+parse_handshake_frame(frame: &[u8]) -> Option<(&[u8; 20], &[u8; 32])>
+
+// Create handshake frames
+create_hello_frame(peer_id: &[u8; 20], public_key: &[u8; 32]) -> Vec<u8>
+create_hello_ack_frame(peer_id: &[u8; 20], public_key: &[u8; 32]) -> Vec<u8>
+
+// Derive session with key flipping
+derive_session_flipped(my_private, their_public, my_id, their_id, session_id) -> Session
+```
 
 ### Reliable chunk transfer
 

@@ -12,7 +12,7 @@ use rand::RngCore;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::constants::{NONCE_LEN, TAG_LEN};
+use crate::constants::{F_HELLO, F_HELLO_ACK, NONCE_LEN, TAG_LEN};
 
 /// HKDF label for session key derivation
 const SESSION_KEY_LABEL: &[u8] = b"p2p-v12-session";
@@ -154,6 +154,61 @@ pub fn decrypt(session: &Session, data: &[u8]) -> Option<Vec<u8>> {
         Ok(plaintext) => Some(plaintext),
         Err(_) => None,
     }
+}
+
+/// Parse HELLO/HELLO_ACK frame
+/// Returns Some((peer_id, public_key)) or None if invalid
+pub fn parse_handshake_frame(frame: &[u8]) -> Option<(&[u8; 20], &[u8; 32])> {
+    // Validate frame type
+    if frame.is_empty() || (frame[0] != F_HELLO && frame[0] != F_HELLO_ACK) {
+        return None;
+    }
+    
+    // Validate frame length (1 + 20 + 32 = 53)
+    if frame.len() != 1 + 20 + 32 {
+        return None;
+    }
+    
+    let peer_id: &[u8; 20] = frame[1..21].try_into().ok()?;
+    let public_key: &[u8; 32] = frame[21..53].try_into().ok()?;
+    
+    Some((peer_id, public_key))
+}
+
+/// Create HELLO frame (0xA1)
+pub fn create_hello_frame(peer_id: &[u8; 20], public_key: &[u8; 32]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(1 + 20 + 32);
+    frame.push(F_HELLO);
+    frame.extend_from_slice(peer_id);
+    frame.extend_from_slice(public_key);
+    frame
+}
+
+/// Create HELLO_ACK frame (0xA2)
+pub fn create_hello_ack_frame(peer_id: &[u8; 20], public_key: &[u8; 32]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(1 + 20 + 32);
+    frame.push(F_HELLO_ACK);
+    frame.extend_from_slice(peer_id);
+    frame.extend_from_slice(public_key);
+    frame
+}
+
+/// Derive session keys with peer ID comparison for send/recv key flipping
+pub fn derive_session_flipped(
+    my_private: &[u8; 32],
+    their_public: &[u8; 32],
+    my_id: &[u8; 20],
+    their_id: &[u8; 20],
+    session_id: u32
+) -> Session {
+    let mut session = derive_session(my_private, their_public, session_id);
+    
+    // Compare peer IDs lexicographically
+    if their_id < my_id {
+        std::mem::swap(&mut session.send_key, &mut session.recv_key);
+    }
+    
+    session
 }
 
 #[cfg(test)]

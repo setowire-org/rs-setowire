@@ -1,0 +1,38 @@
+# Build artifacts
+/target
+**/target
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+*.local
+
+# Logs
+*.log
+
+# Rust
+Cargo.lock
+
+# Binary outputs
+*.exe
+*.pdb
+*.dll
+*.so
+*.dylib
+
+# Test outputs
+*.profraw
+*.profdata
+
+# Temp files
+*.tmp
+*.bak
+*.orig
