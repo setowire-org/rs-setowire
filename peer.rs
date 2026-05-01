@@ -32,13 +32,13 @@ pub struct Peer {
     /// Current remote address
     pub remote_addr: SocketAddr,
     /// Alternative addresses with RTT
-    addrs: HashMap<SocketAddr, f64>,
+    pub addrs: HashMap<SocketAddr, f64>,
     /// Best address (lowest RTT)
     best_addr: SocketAddr,
     /// Last activity time
-    last_seen: Instant,
+    pub last_seen: Instant,
     /// Whether connection is open
-    open: bool,
+    pub open: bool,
     /// Whether peer is in mesh
     pub in_mesh: bool,
     /// Time when peer joined mesh
