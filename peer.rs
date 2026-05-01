@@ -49,10 +49,10 @@ pub struct Peer {
     pub rtt: f64,
     /// Estimated bandwidth (bytes/sec)
     pub bandwidth: f64,
-    /// Session encryption state
-    session: Option<Session>,
-    /// Their public key
-    their_pub: Option<[u8; 32]>,
+    /// Session encryption state (public for swarm access)
+    pub session: Option<Session>,
+    /// Their public key (public for swarm access)
+    pub their_pub: Option<[u8; 32]>,
     /// Control queue
     ctrl_queue: RingBuffer<Vec<u8>>,
     /// Data queue
@@ -139,6 +139,18 @@ impl Peer {
     /// Set swarm reference
     pub fn set_swarm(&mut self, swarm: std::sync::Arc<tokio::sync::Mutex<()>>) {
         self.swarm = Some(swarm);
+    }
+
+    /// Get current send sequence number
+    pub fn send_seq(&self) -> u32 {
+        self.send_seq
+    }
+
+    /// Increment and return next send sequence number
+    pub fn next_send_seq(&mut self) -> u32 {
+        let seq = self.send_seq;
+        self.send_seq = self.send_seq.wrapping_add(1);
+        seq
     }
 
     /// Write control data (unencrypted)

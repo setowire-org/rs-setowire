@@ -36,3 +36,4 @@ Cargo.lock
 *.tmp
 *.bak
 *.orig
+js-setowire/

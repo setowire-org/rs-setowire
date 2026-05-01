@@ -1,6 +1,7 @@
 //! Crypto module - X25519 key exchange and ChaCha20-Poly1305 encryption
 //!
 //! Session key derivation uses HKDF-SHA256 with label "p2p-v12-session"
+//! Compatible with js-setowire protocol
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
@@ -14,8 +15,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::constants::{F_HELLO, F_HELLO_ACK, NONCE_LEN, TAG_LEN};
 
-/// HKDF label for session key derivation
-const SESSION_KEY_LABEL: &[u8] = b"p2p-v12-session";
+/// HKDF info label for session key derivation (matches js-setowire)
+const SESSION_KEY_INFO: &[u8] = b"p2p-v12-session";
 
 /// X25519 key pair
 #[derive(Clone)]
@@ -80,22 +81,26 @@ pub fn generate_x25519(seed: Option<&[u8]>) -> KeyPair {
     }
 }
 
-/// Derive session keys from key exchange
-pub fn derive_session(my_private: &[u8; 32], their_public: &[u8; 32], session_id: u32) -> Session {
+/// Derive session keys from key exchange (matches js-setowire crypto.js)
+pub fn derive_session(my_private: &[u8; 32], their_public: &[u8; 32]) -> Session {
     // Perform X25519 key exchange
     let my_secret = StaticSecret::from(*my_private);
     let their_pub = PublicKey::from(*their_public);
     let shared = my_secret.diffie_hellman(&their_pub);
 
-    // HKDF to derive keys
-    let hk = Hkdf::<Sha256>::new(Some(SESSION_KEY_LABEL), shared.as_bytes());
-    let mut okm = [0u8; 64];
-    hk.expand(&[], &mut okm).expect("HKDF expand failed");
+    // HKDF: salt = empty, info = "p2p-v12-session", len = 68 (matches js-setowire)
+    let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+    let mut okm = [0u8; 68];
+    hk.expand(SESSION_KEY_INFO, &mut okm).expect("HKDF expand failed");
 
     let mut send_key = [0u8; 32];
     let mut recv_key = [0u8; 32];
     send_key.copy_from_slice(&okm[..32]);
     recv_key.copy_from_slice(&okm[32..64]);
+    
+    // Session ID from bytes 64-67 (big-endian u32)
+    let session_id_arr: [u8; 4] = [okm[64], okm[65], okm[66], okm[67]];
+    let session_id = u32::from_be_bytes(session_id_arr);
 
     Session {
         send_key,
@@ -126,10 +131,10 @@ pub fn encrypt(session: &mut Session, plaintext: &[u8]) -> Vec<u8> {
     nonce_bytes[10] = (session.send_ctr >> 8) as u8;
     nonce_bytes[11] = session.send_ctr as u8;
 
-    session.send_ctr += 1;
-
+    // Bug C fix: increment AFTER building nonce (matches JS: nonce uses current sendCtr, then ++)
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher.encrypt(nonce, plaintext).expect("encryption failed");
+    session.send_ctr += 1;
 
     // Prepend nonce to ciphertext
     let mut result = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -156,37 +161,37 @@ pub fn decrypt(session: &Session, data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Parse HELLO/HELLO_ACK frame
-/// Returns Some((peer_id, public_key)) or None if invalid
-pub fn parse_handshake_frame(frame: &[u8]) -> Option<(&[u8; 20], &[u8; 32])> {
+/// Parse HELLO/HELLO_ACK frame (matches js-setowire: 41 bytes = 1 + 8 + 32)
+/// Returns Some((peer_id_8bytes, public_key)) or None if invalid
+pub fn parse_handshake_frame(frame: &[u8]) -> Option<(&[u8; 8], &[u8; 32])> {
     // Validate frame type
     if frame.is_empty() || (frame[0] != F_HELLO && frame[0] != F_HELLO_ACK) {
         return None;
     }
     
-    // Validate frame length (1 + 20 + 32 = 53)
-    if frame.len() != 1 + 20 + 32 {
+    // Validate frame length (1 + 8 + 32 = 41)
+    if frame.len() != 1 + 8 + 32 {
         return None;
     }
     
-    let peer_id: &[u8; 20] = frame[1..21].try_into().ok()?;
-    let public_key: &[u8; 32] = frame[21..53].try_into().ok()?;
+    let peer_id: &[u8; 8] = frame[1..9].try_into().ok()?;
+    let public_key: &[u8; 32] = frame[9..41].try_into().ok()?;
     
     Some((peer_id, public_key))
 }
 
-/// Create HELLO frame (0xA1)
-pub fn create_hello_frame(peer_id: &[u8; 20], public_key: &[u8; 32]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(1 + 20 + 32);
+/// Create HELLO frame (0xA1) - 41 bytes = 1 + 8 + 32
+pub fn create_hello_frame(peer_id: &[u8; 8], public_key: &[u8; 32]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(1 + 8 + 32);
     frame.push(F_HELLO);
     frame.extend_from_slice(peer_id);
     frame.extend_from_slice(public_key);
     frame
 }
 
-/// Create HELLO_ACK frame (0xA2)
-pub fn create_hello_ack_frame(peer_id: &[u8; 20], public_key: &[u8; 32]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(1 + 20 + 32);
+/// Create HELLO_ACK frame (0xA2) - 41 bytes = 1 + 8 + 32
+pub fn create_hello_ack_frame(peer_id: &[u8; 8], public_key: &[u8; 32]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(1 + 8 + 32);
     frame.push(F_HELLO_ACK);
     frame.extend_from_slice(peer_id);
     frame.extend_from_slice(public_key);
@@ -194,16 +199,16 @@ pub fn create_hello_ack_frame(peer_id: &[u8; 20], public_key: &[u8; 32]) -> Vec<
 }
 
 /// Derive session keys with peer ID comparison for send/recv key flipping
+/// Uses hex string comparison (matches js-setowire: `this._id < pid`)
 pub fn derive_session_flipped(
     my_private: &[u8; 32],
     their_public: &[u8; 32],
-    my_id: &[u8; 20],
-    their_id: &[u8; 20],
-    session_id: u32
+    my_id: &str,
+    their_id: &str,
 ) -> Session {
-    let mut session = derive_session(my_private, their_public, session_id);
+    let mut session = derive_session(my_private, their_public);
     
-    // Compare peer IDs lexicographically
+    // Compare hex string IDs lexicographically (matches JS: this._id < pid)
     if their_id < my_id {
         std::mem::swap(&mut session.send_key, &mut session.recv_key);
     }
@@ -238,9 +243,9 @@ mod tests {
         let keypair2 = generate_x25519(None);
 
         // Peer 1 deriva sessão
-        let mut session1 = derive_session(&keypair1.private, &keypair2.public, 42);
+        let mut session1 = derive_session(&keypair1.private, &keypair2.public);
         // Peer 2 deriva sessão
-        let session2 = derive_session(&keypair2.private, &keypair1.public, 42);
+        let session2 = derive_session(&keypair2.private, &keypair1.public);
 
         // Verificar que as chaves de sessão são consistentes
         assert_eq!(session1.session_id, session2.session_id);
