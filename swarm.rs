@@ -19,6 +19,70 @@ use crate::structs::{BloomFilter, Lru};
 // Helper: get local IP address
 // ============================================================================
 
+/// Load identity seed - priority: SEED env var > identity.json > random
+fn load_or_create_identity() -> [u8; 32] {
+    // Priority 1: SEED environment variable (manual override)
+    if let Ok(seed_hex) = std::env::var("SEED") {
+        if let Ok(bytes) = hex::decode(&seed_hex) {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                return arr;
+            }
+        }
+    }
+
+    // Priority 2: identity.json file (persistent identity)
+    if let Ok(content) = std::fs::read_to_string("identity.json") {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(serde_json::Value::String(seed_hex)) = map.get("seed") {
+                if let Ok(bytes) = hex::decode(seed_hex) {
+                    if bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        return arr;
+                    }
+                }
+            }
+        }
+    }
+
+    // Priority 3: random (default - each run gets new identity)
+    let mut seed = [0u8; 32];
+    use rand::Rng;
+    rand::thread_rng().fill(&mut seed);
+    seed
+}
+
+/// Load identity seed from identity.json, or return None if doesn't exist
+pub fn load_identity() -> Option<[u8; 32]> {
+    if let Ok(content) = std::fs::read_to_string("identity.json") {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(serde_json::Value::String(seed_hex)) = map.get("seed") {
+                if let Ok(bytes) = hex::decode(seed_hex) {
+                    if bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        return Some(arr);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Save identity seed to identity.json
+pub fn save_identity(seed: &[u8; 32]) -> bool {
+    let seed_hex = hex::encode(seed);
+    let json = serde_json::json!({ "seed": seed_hex });
+    if let Ok(json_str) = serde_json::to_string_pretty(&json) {
+        std::fs::write("identity.json", json_str).is_ok()
+    } else {
+        false
+    }
+}
+
 fn get_local_ip() -> String {
     // Try to get the IP by connecting to an external address (doesn't actually send)
     // This is a standard trick to get the local IP
@@ -100,6 +164,16 @@ pub struct Swarm {
 
 impl Swarm {
     pub async fn new() -> Self {
+        let seed = load_or_create_identity();
+        Self::new_with_seed_inner(seed).await
+    }
+
+    /// Create swarm with a specific seed (for testing/development)
+    pub async fn new_with_seed(seed: [u8; 32]) -> Self {
+        Self::new_with_seed_inner(seed).await
+    }
+
+    async fn new_with_seed_inner(seed: [u8; 32]) -> Self {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
             .await
             .expect("Failed to bind UDP socket");
@@ -109,14 +183,15 @@ impl Swarm {
         let local_ip = get_local_ip();
         let local_port = local_addr.port();
 
-        let keypair = generate_x25519(None);
+        // Use provided seed for deterministic ID
+        let keypair = generate_x25519(Some(&seed));
 
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
         hasher.update(&keypair.public);
         let hash = hasher.finalize();
-        let id       = hex::encode(&hash[..20]);
-        let id_bytes: [u8; 8] = hash[..8].try_into().unwrap_or([0u8; 8]);
+        let id       = hex::encode(&hash[..20]);  // Full 20-byte ID
+        let id_bytes: [u8; 8]  = hash[..8].try_into().unwrap_or([0u8; 8]);  // Only 8 bytes for wire
 
         Swarm {
             socket:    Arc::new(socket),
@@ -153,19 +228,21 @@ impl Swarm {
     pub fn public_addr(&self) -> Option<String> { self.external.map(|a| a.to_string()) }
     pub fn peer_count(&self) -> usize { self.peers.try_lock().map(|g| g.len()).unwrap_or(0) }
 
-    /// Join a topic. topicHash = sha1(hex(topic))[:6] → 12 hex chars
+/// Join a topic - matches JS: SHA1(hex(SHA256(topic))).slice(0, 12)
     pub fn join(&mut self, topic: &[u8], _announce: bool, _lookup: bool) {
+        use sha2::Sha256;
         use sha1::Sha1;
         use digest::Digest;
-        let topic_hex = hex::encode(topic);
-        let mut hasher = Sha1::new();
-        hasher.update(topic_hex.as_bytes());
-        let result = hasher.finalize();
-        let topic_hash = hex::encode(&result[..6]);
-        let topic_hash_for_diag = topic_hash.clone();
+        // 1) SHA256 dos bytes crus
+        let sha256_hash = Sha256::digest(topic);
+        let topic_hex = hex::encode(sha256_hash);
+        // 2) SHA1 da string hexadecimal
+        let mut sha1_hasher = Sha1::new();
+        sha1_hasher.update(topic_hex.as_bytes());
+        let sha1_result = sha1_hasher.finalize();
+        let topic_hash = hex::encode(sha1_result)[..12].to_string();
         self.topic_hash = Some(topic_hash.clone());
         self.piping_topic_hash = Some(topic_hash);
-        
     }
 
     // FIX C1: callbacks são Arc para poder clonar sem mover
@@ -242,7 +319,10 @@ impl Swarm {
 
     pub fn store(&self, _key: &str, _value: &[u8]) {}
     pub async fn fetch(&self, _key: &str) -> Option<Vec<u8>> { None }
+    /// Returns socket address (may be 0.0.0.0)
     pub fn local_addr(&self) -> SocketAddr { self.socket.local_addr().unwrap() }
+    /// Returns the actual local address with real IP (for display/use)
+    pub fn local_address(&self) -> String { format!("{}:{}", self.local_ip, self.local_port) }
     pub fn socket_ref(&self) -> &tokio::net::UdpSocket { &self.socket }
 
     /// Get list of connected peers with details
@@ -284,12 +364,10 @@ impl Swarm {
                     Ok(Ok((len, src))) => {
                         if len < 1 { continue; }
 
-                        // FIX C3: filtro de self só por porta, NÃO por IP.
-                        // Dois processos na mesma máquina têm IPs iguais mas portas diferentes.
-                        if src.port() == local_port { continue; }
-
+                        // REMOVIDO: filtro de self por porta não funciona com NAT.
+                        // A verificação de ID já existe nos handlers HELLO/HELLO_ACK.
                         match buf[0] {
-                            // ------------------------------------------
+// ------------------------------------------
                             // HELLO (0xA1)
                             // ------------------------------------------
                             0xA1 => {
@@ -300,7 +378,6 @@ impl Swarm {
                                 if let Some((_, their_pub)) = parse_handshake_frame(&buf[..len]) {
                                     let their_wire_id = hex::encode(&buf[1..9]);
                                     
-
                                     let session = derive_session_flipped(
                                         &keypair.private,
                                         their_pub,
@@ -320,8 +397,9 @@ impl Swarm {
                                     let p = pg.entry(their_wire_id.clone()).or_insert_with(|| Peer::new(their_wire_id.clone(), src));
                                     p.their_pub = Some(*their_pub);
                                     p.session   = Some(session);
+p.remote_addr = src;  // Update on reconnect
+                                    // Already notified above - don't duplicate
                                     if is_new {
-                                        if let Some(ref cb) = on_connection { cb(p); }
                                         // PEX: enviar lista de peers conhecidos para o novo peer
                                         drop(pg);
                                         let peers_snapshot: Vec<(String, SocketAddr)> = {
@@ -377,8 +455,10 @@ impl Swarm {
                                     let p = pg.entry(their_wire_id.clone()).or_insert_with(|| Peer::new(their_wire_id.clone(), src));
                                     p.their_pub = Some(*their_pub);
                                     p.session   = Some(session);
+                                    p.remote_addr = src;  // Update on reconnect
+                                    // Always notify - chat needs to know about reconnect
+                                    if let Some(ref cb) = on_connection { cb(p); }
                                     if is_new {
-                                        if let Some(ref cb) = on_connection { cb(p); }
                                         // PEX: enviar lista de peers conhecidos para o novo peer
                                         drop(pg);
                                         let peers_snapshot: Vec<(String, SocketAddr)> = {
@@ -499,14 +579,22 @@ impl Swarm {
                                     let a2i = addr_to_id.lock().await;
                                     a2i.get(&src_str).cloned()
                                 };
-                                // fallback: procura pelo ID embutido no PONG (20 bytes)
+                                // fallback: procura pelo ID embutido no PONG (20 bytes completo)
                                 let pid_opt = if pid_opt.is_some() {
                                     pid_opt
-                                } else if len >= 9 {
-                                    // tenta 8 bytes wire-id primeiro
-                                    let wire_id = hex::encode(&buf[1..9]);
+                                } else if len >= 21 {
+                                    // PONG tem formato: [F_PONG][20-byte ID]
+                                    // Tenta os 20 bytes completos primeiro
+                                    let full_id = hex::encode(&buf[1..21]);
                                     let pg = peers.lock().await;
-                                    if pg.contains_key(&wire_id) { Some(wire_id) } else { None }
+                                    if pg.contains_key(&full_id) { Some(full_id) }
+                                    // fallback: 8 bytes wire-id (compatibilidade)
+                                    else if let Ok(wire_id) = hex::decode(&full_id[..16.min(full_id.len())]) {
+                                        if wire_id.len() >= 8 {
+                                            let wire_id_hex = hex::encode(&wire_id[..8]);
+                                            if pg.contains_key(&wire_id_hex) { Some(wire_id_hex) } else { None }
+                                        } else { None }
+                                    } else { None }
                                 } else {
                                     None
                                 };
@@ -540,7 +628,7 @@ impl Swarm {
                                 let count = buf[1] as usize;
                                 let mut i = 2;
                                 for _ in 0..count {
-                                    if i + 14 > len { break; }
+                                    if i + 14 > len { break; }  // 8 bytes ID + 4 bytes IP + 2 bytes port
                                     let peer_id = hex::encode(&buf[i..i+8]);
                                     let ip_bytes: [u8; 4] = [buf[i+8], buf[i+9], buf[i+10], buf[i+11]];
                                     let port = u16::from_be_bytes([buf[i+12], buf[i+13]]);
@@ -607,8 +695,19 @@ impl Swarm {
 
         tokio::spawn(async move {
             let mcast_addr = std::net::Ipv4Addr::new(239, 0, 0, 1);
-            let recv_sock  = match tokio::net::UdpSocket::bind(format!("0.0.0.0:{}", MCAST_PORT)).await {
-                Ok(s)  => s,
+            // Try to bind - if fails (port in use), try different port
+            let bind_result = std::net::UdpSocket::bind(format!("0.0.0.0:{}", MCAST_PORT));
+            let std_sock = match bind_result {
+                Ok(s) => s,
+                Err(_) => {
+                    match std::net::UdpSocket::bind("0.0.0.0:0") {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    }
+                }
+            };
+            let recv_sock = match tokio::net::UdpSocket::from_std(std_sock) {
+                Ok(s) => s,
                 Err(_) => return,
             };
             let _ = recv_sock.join_multicast_v4(mcast_addr, std::net::Ipv4Addr::new(0, 0, 0, 0));
@@ -722,8 +821,8 @@ if let Ok(msg) = std::str::from_utf8(&buf[1..len]) {
                             p.destroy();
                             if let Some(ref cb) = to_disc { cb(&pid); }
                         }
-                        // limpar addr_to_id
-                        to_addr2id.lock().await.retain(|_, v| v != &pid);
+                        // limpar addr_to_id - remove entries pointing to dead peer
+                        to_addr2id.lock().await.retain(|_addr, v| v != &pid);
                     }
                 }
             });
@@ -752,7 +851,7 @@ if let Ok(msg) = std::str::from_utf8(&buf[1..len]) {
         self.query_http_bootstrap().await;
 
         // =========================================================
-        // HTTP Piping Discovery (Bug #3 fix)
+        // HTTP Piping Discovery - compatível com JS
         // POST /announce e GET /lookup para cada servidor
         // =========================================================
         if let Some(ref topic_hash) = self.piping_topic_hash {
@@ -765,9 +864,9 @@ if let Ok(msg) = std::str::from_utf8(&buf[1..len]) {
             let socket = self.socket.clone();
 
             tokio::spawn(async move {
-                // POST announce para cada servidor
+                // POST announce para cada servidor (mesmo formato do JS)
                 for server in PIPING_SERVERS {
-                    let url = format!("https://{}/p2p-{}", server, topic);
+                    let url = format!("https://{}/p2p-{}-announce", server, topic);
                     let client = match reqwest::Client::builder()
                         .timeout(Duration::from_secs(8))
                         .build() {
@@ -779,6 +878,10 @@ if let Ok(msg) = std::str::from_utf8(&buf[1..len]) {
                         "port": local_port,
                     });
                     let _ = client.post(&url).json(&body).send().await;
+                    
+                    // Also post to inbox path like JS does
+                    let inbox_url = format!("https://{}/p2p-{}-{}", server, topic, &id[..20.min(id.len())]);
+                    let _ = client.post(&inbox_url).json(&body).send().await;
                 }
 
                 // GET lookup (long poll loop) para cada servidor

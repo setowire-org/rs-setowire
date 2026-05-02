@@ -118,7 +118,7 @@ pub fn decrypt(session: &Session, data: &[u8]) -> Option<Vec<u8>> {
 /// Parse HELLO / HELLO_ACK frame → (peer_id_8b, pub_key_32b)
 pub fn parse_handshake_frame(frame: &[u8]) -> Option<(&[u8; 8], &[u8; 32])> {
     if frame.is_empty() || (frame[0] != F_HELLO && frame[0] != F_HELLO_ACK) { return None; }
-    if frame.len() != 41 { return None; }
+    if frame.len() != 41 { return None; }  // 1 + 8 + 32 = 41 (JS compatibility)
     let peer_id:    &[u8; 8]  = frame[1..9].try_into().ok()?;
     let public_key: &[u8; 32] = frame[9..41].try_into().ok()?;
     Some((peer_id, public_key))
