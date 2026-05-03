@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 use tokio::time::{interval, sleep};
@@ -481,8 +481,9 @@ impl Swarm {
                 let mut ping = vec![F_PING];
                 ping.extend_from_slice(&ts.to_be_bytes());
                 ping.extend_from_slice(&hb_id_raw);
-                let peers = hb_peers.lock().await;
-                for (_, peer) in peers.iter() {
+                let mut peers = hb_peers.lock().await;
+                for (_, peer) in peers.iter_mut() {
+                    peer.last_ping_sent = ts;
                     let _ = hb_socket.send_to(&ping, peer.remote_addr).await;
                 }
             }
@@ -953,6 +954,13 @@ impl Swarm {
         self.send_via_relay(peer_id, F_DATA, &payload).await
     }
 
+    pub async fn list_peers(&self) -> Vec<(String, f64, bool)> {
+        let peers = self.peers.lock().await;
+        peers.iter()
+            .map(|(id, peer)| (id.clone(), peer.rtt, peer.in_mesh))
+            .collect()
+    }
+
     pub async fn send_via_relay(&self, dest_id: &str, frame_type: u8, payload: &[u8]) -> bool {
         let topic = match &self.topic_hash {
             Some(t) => t.as_str(),
@@ -1048,6 +1056,7 @@ async fn handle_frame(
                     .or_insert_with(|| Peer::new(their_wire_id.clone(), src));
                 p.their_pub = Some(*their_pub);
                 p.session = Some(session);
+                p.in_mesh = true;
                 if is_new {
                     if let Some(ref cb) = on_conn { cb(p); }
                     let peers_snap: Vec<(String, SocketAddr)> = pg.iter().map(|(id, p)| (id.clone(), p.remote_addr)).collect();
@@ -1089,6 +1098,7 @@ async fn handle_frame(
                     .or_insert_with(|| Peer::new(their_wire_id.clone(), src));
                 p.their_pub = Some(*their_pub);
                 p.session = Some(session);
+                p.in_mesh = true;
                 if is_new {
                     if let Some(ref cb) = on_conn { cb(p); }
                     let peers_snap: Vec<(String, SocketAddr)> = pg.iter().map(|(id, p)| (id.clone(), p.remote_addr)).collect();
@@ -1131,6 +1141,7 @@ async fn handle_frame(
             }
         }
         F_PING => {
+            //eprintln!("DEBUG: received PING from {}", src);
             let mut pong = vec![F_PONG];
             let id_raw = hex::decode(my_id).unwrap_or_default();
             pong.extend_from_slice(&id_raw);
@@ -1138,7 +1149,8 @@ async fn handle_frame(
             let src_str = src.to_string();
             if let Some(pid) = addr_to_id.lock().await.get(&src_str).cloned() {
                 if let Some(peer) = peers.lock().await.get_mut(&pid) {
-                    peer.touch(src, None);
+                    peer.last_seen = Instant::now();
+                    peer.open = true;
                 }
             }
         }
@@ -1147,16 +1159,32 @@ async fn handle_frame(
             let pid = addr_to_id.lock().await.get(&src_str).cloned();
             if let Some(pid) = pid {
                 if let Some(peer) = peers.lock().await.get_mut(&pid) {
-                    peer.touch(src, None);
+                    if peer.last_ping_sent > 0 {
+                        let rtt = (now_millis() as f64) - (peer.last_ping_sent as f64);
+                        if rtt > 0.0 && rtt < 100000.0 {
+                            peer.rtt = peer.rtt * (1.0 - RTT_ALPHA) + rtt * RTT_ALPHA;
+                        }
+                        peer.last_ping_sent = 0;
+                    }
+                    peer.last_seen = Instant::now();
+                    peer.open = true;
                 }
-            } else if data.len() >= 17 {
+            } else if data.len() >= 9 {
                 let wire_id = hex::encode(&data[1..9]);
                 let pg = peers.lock().await;
                 if pg.contains_key(&wire_id) {
                     drop(pg);
                     addr_to_id.lock().await.insert(src_str.clone(), wire_id.clone());
                     if let Some(peer) = peers.lock().await.get_mut(&wire_id) {
-                        peer.touch(src, None);
+                        if peer.last_ping_sent > 0 {
+                            let rtt = (now_millis() as f64) - (peer.last_ping_sent as f64);
+                            if rtt > 0.0 && rtt < 100000.0 {
+                                peer.rtt = peer.rtt * (1.0 - RTT_ALPHA) + rtt * RTT_ALPHA;
+                            }
+                            peer.last_ping_sent = 0;
+                        }
+                        peer.last_seen = Instant::now();
+                        peer.open = true;
                     }
                 }
             }

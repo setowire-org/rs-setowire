@@ -74,7 +74,7 @@ pub struct Peer {
     /// Last rate update time
     last_rate: Instant,
     /// Last ping send time
-    last_ping_sent: u64,
+    pub last_ping_sent: u64,
     /// Last pong received time
     last_pong: Instant,
     /// Bytes sent in window

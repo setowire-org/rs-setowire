@@ -46,13 +46,16 @@ async fn main() -> anyhow::Result<()> {
     // Peer tracking
     let known_peers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let peers_nicks = Arc::new(std::sync::Mutex::new(HashMap::<String, String>::new()));
-    let seen_self_ids = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
+    let seen_self_ids_join = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
+    let seen_self_ids_msg = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
 
     let known_peers_conn = known_peers.clone();
     let known_peers_disc = known_peers.clone();
+    let known_peers_data = known_peers.clone();
     let peers_nicks_disconnect = peers_nicks.clone();
     let peers_nicks_data = peers_nicks.clone();
-    let seen_self_ids_data = seen_self_ids.clone();
+    let seen_self_ids_join_data = seen_self_ids_join.clone();
+    let seen_self_ids_msg_data = seen_self_ids_msg.clone();
     let nick_data = nick.clone();
 
     // Connection callback – agora evita duplicatas
@@ -83,14 +86,19 @@ async fn main() -> anyhow::Result<()> {
                 match msg_type {
                     "JOIN" => {
                         if let Some(nick) = json.get("nick").and_then(|v| v.as_str()) {
-                            // prefer `_selfId` para identidade persistente; fallback para peer.id
                             let self_id = json.get("_selfId").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| peer.id.clone());
 
-                            // atualiza mapa de nicks (mantém peer-id também)
                             peers_nicks_data.lock().unwrap().insert(peer.id.clone(), nick.to_string());
 
-                            // dedup por `_selfId`
-                            let mut seen = seen_self_ids_data.lock().unwrap();
+                            // adiciona ao known_peers se ainda não estiver
+                            {
+                                let mut kp = known_peers_data.lock().unwrap();
+                                if !kp.contains(&peer.id) {
+                                    kp.push(peer.id.clone());
+                                }
+                            }
+
+                            let mut seen = seen_self_ids_join_data.lock().unwrap();
                             if !seen.contains(&self_id) {
                                 seen.insert(self_id.clone());
                                 println!("{} * {} joined", ts(), nick);
@@ -98,12 +106,26 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     "MSG" => {
-                        if let Some(nick) = json.get("nick").and_then(|v| v.as_str()) {
-                            peers_nicks_data.lock().unwrap().insert(peer.id.clone(), nick.to_string());
-                            if nick != nick_data {
-                                if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
-                                    let colored = color_nick(nick);
-                                    println!("{}: {}", colored, text);
+                        let self_id = json.get("_selfId").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| peer.id.clone());
+
+                        // adiciona ao known_peers se ainda não estiver
+                        {
+                            let mut kp = known_peers_data.lock().unwrap();
+                            if !kp.contains(&peer.id) {
+                                kp.push(peer.id.clone());
+                            }
+                        }
+
+                        let mut seen = seen_self_ids_msg_data.lock().unwrap();
+                        if !seen.contains(&self_id) {
+                            seen.insert(self_id.clone());
+                            if let Some(nick) = json.get("nick").and_then(|v| v.as_str()) {
+                                peers_nicks_data.lock().unwrap().insert(peer.id.clone(), nick.to_string());
+                                if nick != nick_data {
+                                    if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
+                                        let colored = color_nick(nick);
+                                        println!("{}: {}", colored, text);
+                                    }
                                 }
                             }
                         }
@@ -158,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
                     if !already_sent {
+                        //println!("{} * sending JOIN to {}", ts(), &pid[..8.min(pid.len())]);
                         let _ = swarm_for_join.send_to(pid, &join_bytes).await;
                     }
                 }
@@ -171,7 +194,6 @@ async fn main() -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
     let swarm_input = swarm_arc.clone();
     let my_id_for_input = my_id.clone();
-    let known_peers_input = known_peers.clone();
     let peers_nicks_input = peers_nicks.clone();
 
     std::thread::spawn(move || {
@@ -198,16 +220,12 @@ async fn main() -> anyhow::Result<()> {
         match line.as_str() {
             "/peers" => {
                 let now = chrono::Local::now();
-                let peers_list = known_peers_input.lock().unwrap().clone();
-                println!("[{}] * {} peer(s) connected", now.format("%H:%M"), peers_list.len());
+                let peers_info = swarm_input.list_peers().await;
+                println!("[{}] * {} peer(s) connected", now.format("%H:%M"), peers_info.len());
                 let nicks = peers_nicks_input.lock().unwrap();
-                for pid in &peers_list {
-                    let nick = nicks.get(pid).cloned().unwrap_or_default();
-                    let display = if nick.is_empty() {
-                        format!("{}", &pid[..8.min(pid.len())])
-                    } else {
-                        nick
-                    };
+                for (pid, rtt, in_mesh) in peers_info {
+                    let nick = nicks.get(&pid).cloned().unwrap_or_else(|| "?".to_string());
+                    let display = format!("{} nick={} rtt={:.0}ms mesh={}", &pid[..8.min(pid.len())], nick, rtt, in_mesh);
                     println!("[{}] *   {}", now.format("%H:%M"), display);
                 }
             }
