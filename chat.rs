@@ -2,19 +2,15 @@
 
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
-use std::collections::HashMap;
-use sha2::Digest;
+use std::collections::{HashMap, HashSet};
 use setowire::{Swarm, Peer};
-use hex;
 
 fn ts() -> String {
     chrono::Local::now().format("[%H:%M]").to_string()
 }
 
-// Cores ANSI
+// ANSI colors
 const RESET: &str = "\x1b[0m";
-const GREEN: &str = "\x1b[32m";
-
 const COLORS: [&str; 8] = [
     "\x1b[36m",  // cyan
     "\x1b[33m",  // yellow  
@@ -40,46 +36,37 @@ async fn main() -> anyhow::Result<()> {
 
     println!("{} * starting... nick={} room={}", ts(), nick, room);
 
-    // Override identity with SEED env var if set
-    let mut swarm = if let Ok(seed) = std::env::var("SEED") {
-        if let Ok(bytes) = hex::decode(&seed) {
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                println!("{} * using SEED identity", ts());
-                Swarm::new_with_seed(arr).await
-            } else {
-                Swarm::new().await
-            }
-        } else {
-            Swarm::new().await
-        }
-    } else {
-        Swarm::new().await
-    };
-
+    let mut swarm = Swarm::new().await;
     println!("{} * ready | nat=unknown | addr=LAN", ts());
 
-    // Join topic (same as JS: SHA256('chat:' + room))
-    // The swarm.join() will compute SHA256 internally
+    // Join topic
     let topic = format!("chat:{}", &room);
-    swarm.join(topic.as_bytes(), true, true);
+    swarm.join(topic.as_bytes(), true, true).await;   // async
 
-    // Peer tracking: (peer_id -> nick)
-    let peers_nicks = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<String, String>::new()));
+    // Peer tracking
+    let known_peers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let peers_nicks = Arc::new(std::sync::Mutex::new(HashMap::<String, String>::new()));
+    let seen_self_ids = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
 
-    let peers_conn = peers_nicks.clone();
-    let peers_disc = peers_nicks.clone();
-    let nick_data  = nick.clone();
+    let known_peers_conn = known_peers.clone();
+    let known_peers_disc = known_peers.clone();
+    let peers_nicks_disconnect = peers_nicks.clone();
+    let peers_nicks_data = peers_nicks.clone();
+    let seen_self_ids_data = seen_self_ids.clone();
+    let nick_data = nick.clone();
 
-    // Connection callback (don't print - wait for JOIN message with nick)
+    // Connection callback – agora evita duplicatas
     swarm.on_connection(Arc::new(move |peer: &Peer| {
-        peers_conn.lock().unwrap().insert(peer.id.clone(), String::new());
+        let mut kp = known_peers_conn.lock().unwrap();
+        if !kp.contains(&peer.id) {
+            kp.push(peer.id.clone());
+        }
     }));
 
-    // Disconnection callback - show nick if known, else ID
+    // Disconnection callback – Arc
     swarm.on_disconnection(Arc::new(move |peer_id: &str| {
-        let nick = peers_disc.lock().unwrap().remove(peer_id);
+        known_peers_disc.lock().unwrap().retain(|id| id != peer_id);
+        let nick = peers_nicks_disconnect.lock().unwrap().remove(peer_id);
         match nick {
             Some(n) if !n.is_empty() => println!("{} * {} left", ts(), n),
             _ => {
@@ -89,22 +76,30 @@ async fn main() -> anyhow::Result<()> {
         }
     }));
 
-    // Data callback
+    // Data callback – Arc
     swarm.on_data(Arc::new(move |data: &[u8], peer: &Peer| {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(data) {
             if let Some(msg_type) = json.get("type").and_then(|v| v.as_str()) {
                 match msg_type {
                     "JOIN" => {
                         if let Some(nick) = json.get("nick").and_then(|v| v.as_str()) {
-                            // Store nick for this peer
-                            peers_nicks.lock().unwrap().insert(peer.id.clone(), nick.to_string());
-                            println!("{} * {} joined", ts(), nick);
+                            // prefer `_selfId` para identidade persistente; fallback para peer.id
+                            let self_id = json.get("_selfId").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| peer.id.clone());
+
+                            // atualiza mapa de nicks (mantém peer-id também)
+                            peers_nicks_data.lock().unwrap().insert(peer.id.clone(), nick.to_string());
+
+                            // dedup por `_selfId`
+                            let mut seen = seen_self_ids_data.lock().unwrap();
+                            if !seen.contains(&self_id) {
+                                seen.insert(self_id.clone());
+                                println!("{} * {} joined", ts(), nick);
+                            }
                         }
                     }
                     "MSG" => {
                         if let Some(nick) = json.get("nick").and_then(|v| v.as_str()) {
-                            // Store/update nick
-                            peers_nicks.lock().unwrap().insert(peer.id.clone(), nick.to_string());
+                            peers_nicks_data.lock().unwrap().insert(peer.id.clone(), nick.to_string());
                             if nick != nick_data {
                                 if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
                                     let colored = color_nick(nick);
@@ -119,55 +114,65 @@ async fn main() -> anyhow::Result<()> {
         }
     }));
 
-    // NAT callback - we'll get nat info after start
-    swarm.on_nat(Arc::new(move || {
-        // We'll print from the main loop
-    }));
-
-    // Start swarm after registering callbacks
+    // Start swarm
     swarm.start().await;
 
-    // Wait for LAN discovery and get actual values
+    // Wait a bit and print status
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    let local_addr = swarm.local_address();
-    let nat_type = swarm.nat_type();
+    let external = swarm.external_addr().await;
+    let local_addr = external.unwrap_or_else(|| swarm.local_addr());
+    let _nat_type = swarm.nat_type();
     let my_id = swarm.id().to_string();
-    println!("{} * nat={} addr={}", ts(), nat_type, local_addr);
+    println!("{} * nat={} addr={}", ts(), swarm.nat_type(), local_addr);
     println!("{} * commands: /peers  /nat  /quit", ts());
 
-    // Use Arc for swarm access from multiple tasks
     let swarm_arc = Arc::new(swarm);
+    let joined_peers = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
 
-    // Periodic task: send JOIN to all connected peers - starts immediately
+    // Periodic JOIN sender
     let swarm_for_join = swarm_arc.clone();
+    let known_peers_join = known_peers.clone();
+    let joined_peers_clone = joined_peers.clone();
     let nick_for_join = nick.clone();
     let my_id_clone = my_id.clone();
+
     tokio::spawn(async move {
-        // Send immediately on start
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         loop {
-            let peers = swarm_for_join.list_peers().await;
-            if peers.is_empty() { 
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                continue;
-            }
-            let join_msg = serde_json::json!({
-                "type": "JOIN",
-                "nick": nick_for_join,
-                "_selfId": my_id_clone
-            });
-            for (pid, _addr, _rtt, _connected) in peers {
-                let _ = swarm_for_join.send_to(&pid, join_msg.to_string().as_bytes()).await;
+            let targets = known_peers_join.lock().unwrap().clone();
+            if !targets.is_empty() {
+                let join_msg = serde_json::json!({
+                    "type": "JOIN",
+                    "nick": nick_for_join,
+                    "_selfId": my_id_clone
+                });
+                let join_bytes = join_msg.to_string().into_bytes();
+                for pid in &targets {
+                    let already_sent = {
+                        let mut joined = joined_peers_clone.lock().unwrap();
+                        if joined.contains(pid) {
+                            true
+                        } else {
+                            joined.insert(pid.clone());
+                            false
+                        }
+                    };
+                    if !already_sent {
+                        let _ = swarm_for_join.send_to(pid, &join_bytes).await;
+                    }
+                }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         }
     });
 
-    // Input loop (separate thread to not block runtime)
+    // Input loop
     let nick_loop = nick.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
     let swarm_input = swarm_arc.clone();
     let my_id_for_input = my_id.clone();
+    let known_peers_input = known_peers.clone();
+    let peers_nicks_input = peers_nicks.clone();
 
     std::thread::spawn(move || {
         let stdin = io::stdin();
@@ -193,51 +198,36 @@ async fn main() -> anyhow::Result<()> {
         match line.as_str() {
             "/peers" => {
                 let now = chrono::Local::now();
-                let peers = swarm_input.list_peers().await;
-                println!("[{}] * {} peer(s) connected", now.format("%H:%M"), peers.len());
-                for (id, _addr, rtt, connected) in peers {
-                    let status = if connected { "mesh=true" } else { "mesh=false" };
-                    println!("[{}] *   {} rtt={:.0}ms {}", 
-                        now.format("%H:%M"), 
-                        &id[..8.min(id.len())], 
-                        rtt, 
-                        status
-                    );
+                let peers_list = known_peers_input.lock().unwrap().clone();
+                println!("[{}] * {} peer(s) connected", now.format("%H:%M"), peers_list.len());
+                let nicks = peers_nicks_input.lock().unwrap();
+                for pid in &peers_list {
+                    let nick = nicks.get(pid).cloned().unwrap_or_default();
+                    let display = if nick.is_empty() {
+                        format!("{}", &pid[..8.min(pid.len())])
+                    } else {
+                        nick
+                    };
+                    println!("[{}] *   {}", now.format("%H:%M"), display);
                 }
             }
             "/nat" => {
-                println!("{} * nat={} addr={}", ts(), swarm_input.nat_type(), swarm_input.local_address());
-            }
-            s if s.starts_with("/dial ") => {
-                let parts: Vec<&str> = s.split(' ').collect();
-                if parts.len() >= 3 {
-                    let ip = parts[1];
-                    let port: u16 = parts[2].parse().unwrap_or(0);
-                    if port > 0 {
-                        swarm_input.dial(ip, port).await;
-                        println!("{} * dialing {}:{}", ts(), ip, port);
-                    } else {
-                        println!("{} * invalid port", ts());
-                    }
-                } else {
-                    println!("{} * usage: /dial <ip> <port>", ts());
-                }
+                let addr = swarm_input.external_addr().await.unwrap_or_else(|| swarm_input.local_addr());
+                println!("{} * nat={} addr={}", ts(), swarm_input.nat_type(), addr);
             }
             "/quit" | "/exit" => {
                 println!("{} * goodbye!", ts());
                 break;
             }
             _ => {
-                // Envia no mesmo formato JSON que o JS espera
                 let msg = serde_json::json!({
                     "type": "MSG",
                     "nick": nick_loop,
                     "text": line,
                     "_selfId": my_id_for_input
                 });
-                let sent = swarm_input.broadcast(msg.to_string().as_bytes());
-                // Eco local colorido
-                println!("\x1b[32mvoce\x1b[0m: {}", line);
+                let sent = swarm_input.broadcast(msg.to_string().as_bytes()).await;
+                println!("\x1b[32myou\x1b[0m: {}", line);
                 if sent == 0 {
                     println!("{} * no peers connected yet", ts());
                 }
@@ -245,9 +235,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Try to get ownership for destroy, otherwise just let it drop
     if let Ok(mut swarm) = Arc::try_unwrap(swarm_arc) {
         swarm.destroy().await;
     }
     Ok(())
 }
+
+//on00dev

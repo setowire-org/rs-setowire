@@ -21,6 +21,8 @@ pub const STUN_HOSTS: &[(&str, u16)] = &[
     ("stun.stunprotocol.org", 3478),
     ("global.stun.twilio.com", 3478),
     ("stun.ekiga.net", 3478),
+    ("stun.sipnet.com", 3478),
+    ("stun.voipbuster.com", 3478),
 ];
 
 // ============================================================================
@@ -246,7 +248,7 @@ pub const RTT_INIT: f64 = 100.0;
 /// Drain timeout (ms)
 pub const DRAIN_TIMEOUT: u64 = 2000;
 /// STUN fast timeout (ms)
-pub const STUN_FAST_TIMEOUT: u64 = 1500;
+pub const STUN_FAST_TIMEOUT: u64 = 4000;
 
 // ============================================================================
 // Crypto

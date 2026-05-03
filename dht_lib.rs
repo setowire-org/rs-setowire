@@ -17,7 +17,7 @@ use std::time::Instant;
 const K: usize = 20; // K-bucket size
 const ALPHA: usize = 3; // Parallel queries
 const ID_BYTES: usize = 20;
-const TIMEOUT_MS: u64 = 5000;
+const _TIMEOUT_MS: u64 = 5000;
 
 // Message types
 const MSG_PING: u8 = 0x01;
@@ -236,7 +236,7 @@ impl SimpleDht {
     /// Create with specific node ID
     pub fn with_id(node_id: &str, port: u16) -> Self {
         let id_bytes = hex::decode(node_id)
-            .map(|mut v| {
+            .map(| v| {
                 let mut arr = [0u8; ID_BYTES];
                 let len = v.len().min(ID_BYTES);
                 arr[..len].copy_from_slice(&v[..len]);

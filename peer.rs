@@ -314,7 +314,7 @@ impl Peer {
     }
 
     /// Add an address
-    fn add_addr(&mut self, addr: SocketAddr, rtt: f64) {
+    fn _add_addr(&mut self, addr: SocketAddr, rtt: f64) {
         self.addrs.insert(addr, rtt);
     }
 

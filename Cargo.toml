@@ -14,7 +14,7 @@ categories = ["network-programming", "p2p"]
 tokio = { version = "1", features = ["full"] }
 
 # HTTP client for bootstrap
-reqwest = { version = "0.12", features = ["json"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Cryptography
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -38,6 +38,8 @@ tracing = "0.1"
 thiserror = "1.0"
 anyhow = "1.0"
 chrono = "0.4"
+base64 = "0.22"
+hostname = "0.3"
 
 [dev-dependencies]
 tokio-test = "0.4"
